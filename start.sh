@@ -8,6 +8,13 @@ cd "$(dirname "$0")"
 
 KIOSK_PID=""
 
+# ── Auto-install Python dependencies ─────────────────────────────────────────
+if [ -f requirements.txt ]; then
+  echo "📦  Checking / installing Python dependencies…"
+  pip install -q -r requirements.txt
+  echo "✅  Dependencies ready."
+fi
+
 # ── Graceful teardown ─────────────────────────────────────────────────────────
 cleanup() {
   echo ""
@@ -71,11 +78,18 @@ else
 fi
 
 echo ""
-echo "🚀  Launching kiosk… (Press Q or Esc in the window to stop)"
+echo "🚀  Launching Qt kiosk… (Press Q or Esc in the window to stop)"
 echo ""
 
-# ── Launch kiosk ──────────────────────────────────────────────────────────────
-/usr/bin/python3 door_kiosk.py $SERIAL_PORT &
+# ── Ensure DISPLAY is set (required by Qt on Linux/Ubuntu) ───────────────────
+if [ "$OS_TYPE" = "Linux" ] && [ -z "${DISPLAY:-}" ]; then
+  export DISPLAY=:0
+  echo "🖥️   DISPLAY not set — defaulting to :0"
+fi
+
+# ── Launch Qt kiosk ───────────────────────────────────────────────────────────
+"$PYTHON_BIN" door_kiosk_qt.py $SERIAL_PORT &
 KIOSK_PID=$!
 echo "    Kiosk PID: $KIOSK_PID"
+
 wait $KIOSK_PID || true

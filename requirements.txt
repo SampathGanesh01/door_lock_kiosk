@@ -1,9 +1,16 @@
 # ─────────────────────────────────────────────────────────────────
 #  Door Lock Kiosk — Python Dependencies
 #  Install with:  pip install -r requirements.txt
+#
+#  Ubuntu system packages needed before pip install:
+#    sudo apt update
+#    sudo apt install -y python3-pip python3-venv \
+#         libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
+#         python3-pyqt5
 # ─────────────────────────────────────────────────────────────────
 
 # Computer Vision — camera capture, Haar face detection, drawing
+# Ubuntu/Linux kiosk with display window → use opencv-python (NOT headless)
 opencv-python>=4.8.0
 
 # Numerical computing — ArcFace embedding vectors, cosine distance
@@ -14,9 +21,17 @@ numpy>=1.24.0
 deepface>=0.0.93
 
 # TensorFlow backend required by DeepFace/ArcFace
+# macOS (Intel):        tensorflow>=2.13.0
+# macOS Apple Silicon:  tensorflow-macos>=2.13.0  (uncomment below)
+# Ubuntu/Linux x86_64:  tensorflow>=2.13.0
 tensorflow>=2.13.0
-# tensorflow-macos>=2.13.0   # ← uncomment instead on Apple Silicon Macs
+# tensorflow-macos>=2.13.0
 
 # Arduino / serial door control — for --port flag
-#   Only needed if an Arduino is wired up; safe to skip otherwise
+#   Only needed if an Arduino is wired up
 pyserial>=3.5
+
+# PyQt5 — full-screen kiosk UI (frameless window, no taskbar)
+# On Ubuntu, prefer the system package: sudo apt install python3-pyqt5
+# Falls back to pip if system package not present:
+PyQt5>=5.15.0
