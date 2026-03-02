@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────────
+#  Door Lock Kiosk — Python Dependencies
+#  Install with:  pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────
+
+# Computer Vision — camera capture, Haar face detection, drawing
+opencv-python>=4.8.0
+
+# Numerical computing — ArcFace embedding vectors, cosine distance
+numpy>=1.24.0
+
+# Deep-learning face recognition — ArcFace 512-D embeddings
+#   First run downloads ~500 MB of model weights (cached in ~/.deepface/)
+deepface>=0.0.93
+
+# TensorFlow backend required by DeepFace/ArcFace
+tensorflow>=2.13.0
+# tensorflow-macos>=2.13.0   # ← uncomment instead on Apple Silicon Macs
+
+# Arduino / serial door control — for --port flag
+#   Only needed if an Arduino is wired up; safe to skip otherwise
+pyserial>=3.5
