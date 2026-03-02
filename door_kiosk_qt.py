@@ -1,7 +1,7 @@
 """
 Door Lock Kiosk — Qt Edition v2
 =================================
-Full-screen PyQt5 kiosk. No window chrome, no taskbar, no cursor.
+Full-screen PySide6 kiosk. No window chrome, no taskbar, no cursor.
 ArcFace 512-D face recognition + Arduino serial door control.
 
 States
@@ -25,17 +25,17 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel,
     QHBoxLayout, QVBoxLayout, QStackedWidget, QSizePolicy,
 )
-from PyQt5.QtCore  import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF
-from PyQt5.QtGui   import (
+from PySide6.QtCore  import Qt, QTimer, QThread, Signal, QRectF, QPointF
+from PySide6.QtGui   import (
     QImage, QPixmap, QFont, QPainter, QColor, QPen,
     QBrush, QLinearGradient,
 )
 try:
-    from PyQt5.QtSvg import QSvgWidget, QSvgRenderer
+    from PySide6.QtSvg import QSvgWidget, QSvgRenderer
     _HAS_SVG = True
 except ImportError:
     _HAS_SVG = False
@@ -603,7 +603,7 @@ class DeniedPanel(QWidget):
 #  Camera Thread
 # ═══════════════════════════════════════════════════════════════════════════════
 class CameraThread(QThread):
-    frame_ready = pyqtSignal(object)   # emits np.ndarray
+    frame_ready = Signal(object)   # emits np.ndarray
 
     def __init__(self, cam_index: int = 0):
         super().__init__()
@@ -950,7 +950,7 @@ def main():
     signal.signal(signal.SIGINT,  _sig)
     signal.signal(signal.SIGTERM, _sig)
 
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
