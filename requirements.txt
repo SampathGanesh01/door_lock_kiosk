@@ -6,7 +6,7 @@
 #    sudo apt update
 #    sudo apt install -y python3-pip python3-venv \
 #         libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 \
-#         python3-pyqt5
+#         python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets
 # ─────────────────────────────────────────────────────────────────
 
 # Computer Vision — camera capture, Haar face detection, drawing
@@ -31,7 +31,6 @@ tensorflow>=2.13.0
 #   Only needed if an Arduino is wired up
 pyserial>=3.5
 
-# PyQt5 — full-screen kiosk UI (frameless window, no taskbar)
-# On Ubuntu, prefer the system package: sudo apt install python3-pyqt5
-# Falls back to pip if system package not present:
-PyQt5>=5.15.0
+# PySide6 — full-screen kiosk UI (frameless window, no taskbar)
+# On Ubuntu, prefer the pip package:
+PySide6>=6.5.0

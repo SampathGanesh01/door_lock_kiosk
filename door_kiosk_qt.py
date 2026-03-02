@@ -929,9 +929,10 @@ def main():
     print(f"🖥️   Screen: {screen.width()}x{screen.height()}  →  scale factor: {_SCALE:.2f}")
 
     # Dark palette so Qt fills any unset areas correctly
+    from PySide6.QtGui import QPalette
     pal = app.palette()
-    pal.setColor(pal.Window, QColor(_BG))
-    pal.setColor(pal.WindowText, QColor(_TEXT))
+    pal.setColor(QPalette.Window, QColor(_BG))
+    pal.setColor(QPalette.WindowText, QColor(_TEXT))
     app.setPalette(pal)
 
     door       = DoorController(args.port, args.baud)
