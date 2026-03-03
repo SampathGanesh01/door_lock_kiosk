@@ -641,8 +641,7 @@ class StartupPanel(QWidget):
         self.setStyleSheet(f"background:{_BG};")
         lay = QVBoxLayout(self)
         
-        # Adding a massive top margin creates natural visual centering.
-        lay.addSpacing(_s(120))
+        lay.addStretch(3)
         
         # Render the large SVG ASBL Logo in the centre
         logo = QLabel()
@@ -666,14 +665,16 @@ class StartupPanel(QWidget):
         welcome.setAlignment(Qt.AlignCenter)
         lay.addWidget(welcome)
         
-        # Loading Indicator Text
+        lay.addStretch(2)
+        
+        # Loading Indicator Text (Moved lower, made larger)
         self._status = QLabel("Loading AI Models...")
-        self._status.setFont(_font(14, False))
+        self._status.setFont(_font(18, True))
         self._status.setStyleSheet(f"color: {_MUTED}; background:transparent;")
         self._status.setAlignment(Qt.AlignCenter)
         lay.addWidget(self._status)
 
-        lay.addStretch()
+        lay.addSpacing(_s(40))
 
 
 class StandbyPanel(QWidget):
@@ -1314,8 +1315,12 @@ class KioskWindow(QMainWindow):
                 # Discard frames while waiting for AI models to warm up in background
                 return
 
-        # ── STANDBY ────────────────────────────────────────────────────────────
+        # ── STANDBY (Cooldown wait) ────────────────────────────────────────────
         elif self._state == "STANDBY":
+            # If we are in a forced cooldown (e.g silent deny), ignore camera until it expires
+            if now < self._state_end:
+                return
+
             if now - self._last_scan >= SCAN_INTERVAL:
                 self._last_scan = now
 
@@ -1391,12 +1396,17 @@ class KioskWindow(QMainWindow):
 
         # ── SCANNING ───────────────────────────────────────────────────────────
         elif self._state == "SCANNING":
-            # Safety: timeout — if stuck too long, go to DENIED
+            # Safety: timeout — if stuck too long, go to DENIED automatically
             if now - self._scan_start > SCANNING_TIMEOUT:
-                print(f"[SCAN] Timeout after {SCANNING_TIMEOUT}s — DENIED")
-                self._door.close()
-                self._state_end = now + DENIED_HOLD_SECS
-                self._enter("DENIED")
+                if self._scan_count >= 3:
+                    print(f"[SCAN] Timeout + 3 fails — HARD DENIED")
+                    self._door.close()
+                    self._state_end = now + DENIED_HOLD_SECS
+                    self._enter("DENIED")
+                else:
+                    print(f"[SCAN] Timeout — SILENT RETRY (1.5s cooldown)")
+                    self._state_end = now + 1.5
+                    self._enter("STANDBY")
                 return
 
             # Fire the next recognition pass if we still have attempts left
@@ -1533,10 +1543,15 @@ class KioskWindow(QMainWindow):
             return
 
         # Out of attempts without a match
-        print(f"DENIED: 0 matches after {SCAN_ATTEMPTS} attempts")
-        self._door.close()
-        self._state_end = time.time() + DENIED_HOLD_SECS
-        self._enter("DENIED")
+        if self._scan_count >= 3:
+            print(f"DENIED: 0 matches after {SCAN_ATTEMPTS} attempts")
+            self._door.close()
+            self._state_end = time.time() + DENIED_HOLD_SECS
+            self._enter("DENIED")
+        else:
+            print(f"SILENT DENIED: {self._scan_count} attempts. 1.5s cooldown.")
+            self._state_end = time.time() + 1.5
+            self._enter("STANDBY")
 
 
 
