@@ -47,8 +47,8 @@ LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asbl_logo.
 # ── Config ────────────────────────────────────────────────────────────────────
 FACES_DB          = "faces.json"
 RECOGNITION_MODEL = "ArcFace"
-COSINE_THRESHOLD  = 0.45   # unified with server; 0.40 was too strict for real-world mobile photos
-MIN_FACE_PIXELS   = 70
+COSINE_THRESHOLD  = 0.50   # relaxed slightly to account for Haar/RetinaFace alignment margin
+MIN_FACE_PIXELS   = 120    # must be large enough for stable recognition without blur
 SCAN_INTERVAL     = 1.5
 DOOR_OPEN_SECS    = 5
 DENIED_HOLD_SECS  = 3
@@ -72,14 +72,12 @@ PRESENCE_COOLDOWN = 3.0    # seconds of no motion → hide guide, stay STANDBY
 # ── Debug overlay ──────────────────────────────────────────────────────────────
 DEBUG_AOI = False   # set True to always draw AOI box for physical alignment tuning
 
-# ── Multi-frame voting ─────────────────────────────────────────────────────────
-# ArcFace runs SCAN_FRAMES times per session; a name needs SCAN_MIN_VOTES
-# matching results to be accepted. This eliminates single-frame false positives
-# caused by blinks, slight angles, or motion blur.
-SCAN_FRAMES      = 5     # recognition passes per SCANNING session
-SCAN_MIN_VOTES   = 3     # minimum matching votes required to grant access (3/5)
-SCANNING_TIMEOUT = 5.0   # seconds max in SCANNING before giving up (→ DENIED)
-
+# ── Single-shot Recognition (RPi Optimized) ───────────────────────────────────
+# We use a 1.5s window. It succeeds immediately on the first ArcFace match.
+# Stable bounding box required for 200ms before embedding to prevent blur.
+SCAN_ATTEMPTS     = 3      # maximum ArcFace attempts per scanning session
+SCANNING_TIMEOUT  = 1.5    # seconds max in SCANNING window before giving up (→ DENIED)
+SCAN_STABILIZE_MS = 0.2    # seconds of stable bounding box required before embedding
 
 # ── Qt colours ────────────────────────────────────────────────────────────────
 _BG       = "#0a0a1a"
@@ -180,7 +178,45 @@ class FaceRecognizer:
         self._cascade  = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        
+        # ── In-Memory Database ──
+        self._db = {}
+        self._emb_matrix = np.array([])
+        self._names = []
+        self._db_lock = threading.Lock()
+        self.reload_db()
+        
         threading.Thread(target=self._load, daemon=True).start()
+
+    def reload_db(self):
+        """Load faces.json into memory and pre-flatten embeddings for instant vectorized matching."""
+        if not os.path.exists(FACES_DB):
+            return
+            
+        with open(FACES_DB, "r") as f:
+            try:
+                data = json.load(f)
+            except Exception as e:
+                print(f"[DB] Error parsing {FACES_DB}: {e}")
+                return
+                
+        embeddings = []
+        names = []
+        for name, user_data in data.items():
+            for emb in user_data.get("embeddings", []):
+                if len(emb) > 0:
+                    embeddings.append(emb)
+                    names.append(name)
+                    
+        with self._db_lock:
+            self._db = data
+            if embeddings:
+                self._emb_matrix = np.array(embeddings, dtype=np.float32)
+                self._names = names
+            else:
+                self._emb_matrix = np.array([])
+                self._names = []
+        print(f"[DB] Loaded {len(names)} total embeddings into memory.")
 
     def _load(self):
         if self._stop.is_set():
@@ -217,37 +253,15 @@ class FaceRecognizer:
         return self._ready
 
     def detect_faces(self, frame):
-        """Detect faces in a BGR frame. Returns list of (x, y, w, h) tuples.
-
-        Uses RetinaFace when the model is loaded (accurate, handles angles),
-        falls back to Haar cascade during startup (fast but less accurate).
-        RetinaFace confidence gate at 0.70 eliminates near-false-positive blobs.
+        """Detect faces in a BGR frame using solely a Haar Cascade. Returns (x,y,w,h).
+        
+        By skipping RetinaFace during detection, we save massive amounts of CPU on the 
+        Raspberry Pi. RetinaFace is now strictly reserved for the final Alignment pass
+        inside `embed()`.
         """
-        if self._ready and self._DeepFace is not None:
-            try:
-                faces = self._DeepFace.extract_faces(
-                    img_path=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                    detector_backend="retinaface",
-                    enforce_detection=False,
-                    align=False,   # just bounding boxes, not aligned crops
-                )
-                rects = []
-                for f in faces:
-                    # Skip low-confidence detections (lighting artefacts, partial faces)
-                    if f.get("confidence", 1.0) < 0.70:
-                        continue
-                    region = f["facial_area"]
-                    x, y, w, h = region["x"], region["y"], region["w"], region["h"]
-                    if w >= MIN_FACE_PIXELS:
-                        rects.append((x, y, w, h))
-                return rects
-            except Exception as e:
-                print(f"  [RetinaFace] fallback to Haar: {e}")
-
-        # Fallback: Haar cascade (used during model startup)
         gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         rects = self._cascade.detectMultiScale(
-            gray, scaleFactor=1.12, minNeighbors=5,
+            gray, scaleFactor=1.2, minNeighbors=5,
             minSize=(MIN_FACE_PIXELS, MIN_FACE_PIXELS)
         )
         return list(rects) if len(rects) else []
@@ -297,18 +311,28 @@ class FaceRecognizer:
 
     def identify(self, bgr_crop):
         emb = self.embed(bgr_crop)
-        if emb is None or not os.path.exists(FACES_DB):
+        if emb is None:
             return None, 0
-        with open(FACES_DB) as f:
-            db = json.load(f)
-        best_name, best_dist = None, float("inf")
-        for name, data in db.items():
-            for stored in data.get("embeddings", []):
-                d = self.cosine_dist(emb, stored)
-                if d < best_dist:
-                    best_dist, best_name = d, name
+            
+        with self._db_lock:
+            if len(self._emb_matrix) == 0:
+                return None, 0
+                
+            # Vectorized Cosine Similarity
+            norms = np.linalg.norm(self._emb_matrix, axis=1) * np.linalg.norm(emb)
+            norms[norms == 0] = 1e-9 # Prevent div zero
+            similarities = np.dot(self._emb_matrix, emb) / norms
+            distances = 1.0 - similarities
+            
+            idx = np.argmin(distances)
+            best_dist = distances[idx]
+            best_name = self._names[idx]
+            
         if best_dist <= COSINE_THRESHOLD:
-            return best_name, max(0, min(int((1 - best_dist / COSINE_THRESHOLD) * 100), 100))
+            # Convert to 0-100% confidence
+            conf = max(0, min(int((1 - float(best_dist) / COSINE_THRESHOLD) * 100), 100))
+            return best_name, conf
+            
         return None, 0
 
 
@@ -1124,10 +1148,9 @@ class KioskWindow(QMainWindow):
         self._last_faces : list = []
         self._last_scan  = 0.0
         self._last_presence = 0.0                    # timestamp of last detected motion
-        # ── Multi-frame voting state ─────────────────────────────────────────
-        self._scan_votes : dict  = {}    # {name: vote_count}
-        self._scan_confs : dict  = {}    # {name: best_confidence}
-        self._scan_count : int   = 0     # recognition passes completed this session
+        
+        # ── Single-shot recognition state ────────────────────────────────────
+        self._scan_count : int   = 0     # ArcFace attempts this session
         self._scan_start : float = 0.0   # when SCANNING state was entered
 
         self._state_end  = 0.0
@@ -1202,13 +1225,16 @@ class KioskWindow(QMainWindow):
     def _force_sync(self):
         # The worker is already running every 5 seconds, but to make the button
         # feel responsive immediately without managing threading locks tightly,
-        # we restart the worker loop
         self._header.sync_btn.setText("Syncing...")
         self._header.sync_btn.setEnabled(False)
         self._api_worker.stop()
         self._api_worker = ApiSyncWorker()
         self._api_worker.sync_completed.connect(self._on_sync_completed)
         self._api_worker.start()
+        
+        # Reload memory database instantly after a sync completes
+        self._recognizer.reload_db()
+        
         QTimer.singleShot(1000, lambda: self._header.sync_btn.setText("Sync Now"))
         QTimer.singleShot(1000, lambda: self._header.sync_btn.setEnabled(True))
 
@@ -1315,29 +1341,32 @@ class KioskWindow(QMainWindow):
         elif self._state == "SCANNING":
             # Safety: timeout — if stuck too long, go to DENIED
             if now - self._scan_start > SCANNING_TIMEOUT:
-                print(f"[VOTE] Timeout after {SCANNING_TIMEOUT}s — DENIED")
+                print(f"[SCAN] Timeout after {SCANNING_TIMEOUT}s — DENIED")
                 self._door.close()
                 self._state_end = now + DENIED_HOLD_SECS
                 self._enter("DENIED")
                 return
 
-            # Fire the next recognition pass while votes are still needed
-            if not self._reco_busy and self._scan_count < SCAN_FRAMES:
+            # Fire the next recognition pass if we still have attempts left
+            if not self._reco_busy and self._scan_count < SCAN_ATTEMPTS:
                 self._run_recognition(frame)
 
-            # Live display: face box + AOI overlay + vote progress text
+            # Live display: face box + AOI overlay + attempt progress text
             display = frame.copy()
             for (fx, fy, fw, fh) in self._last_faces:
                 draw_corner_box(display, fx, fy, fx+fw, fy+fh, _CV_CYAN, t=3)
             draw_aoi_overlay(display, state="ready")
 
-            # Vote progress bar drawn at bottom-left
+            # Progress bar drawn at bottom-left
             H, W = display.shape[:2]
             bar_w = int(W * 0.35)
-            progress = int(bar_w * (self._scan_count / max(SCAN_FRAMES, 1)))
+            progress = int(bar_w * (self._scan_count / max(SCAN_ATTEMPTS, 1)))
             cv2.rectangle(display, (20, H - 38), (20 + bar_w, H - 18), (60, 60, 60), -1)
             cv2.rectangle(display, (20, H - 38), (20 + progress, H - 18), (50, 220, 80), -1)
-            label = f"Scan {self._scan_count}/{SCAN_FRAMES}"
+            
+            # Show time left before timeout DENIED
+            tl = max(0.0, SCANNING_TIMEOUT - (now - self._scan_start))
+            label = f"Scanning... {tl:.1f}s"
             cv2.putText(display, label, (22, H - 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
             self._cam_view.set_frame(display)
@@ -1413,6 +1442,9 @@ class KioskWindow(QMainWindow):
         recognizer = self._recognizer
 
         def work():
+            # Wait for stabilization to prevent blurry frames matching
+            time.sleep(SCAN_STABILIZE_MS)
+            
             if not recognizer.ready:
                 # Wait for model to load
                 for _ in range(60):
@@ -1425,45 +1457,31 @@ class KioskWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_recognition_result(self, name: str | None, conf: float):
-        """Accumulate one recognition pass and decide after SCAN_FRAMES results.
-
-        Decision logic:
-          - Collect up to SCAN_FRAMES ArcFace results.
-          - A name wins only if it gets >= SCAN_MIN_VOTES votes (majority).
-          - If no name reaches the threshold → DENIED.
-          - Best confidence across winning passes is shown in WELCOME.
+        """Process a single ArcFace recognition pass.
+        
+        Succeeds immediately on the first match. If no match, it increments scan attempt
+        counter. If attempts run out or timeout expires (handled in _tick), goes to DENIED.
         """
-        # Accumulate this pass
         self._scan_count += 1
+        
         if name:
-            self._scan_votes[name] = self._scan_votes.get(name, 0) + 1
-            # Keep the best (highest) confidence for this name
-            self._scan_confs[name] = max(self._scan_confs.get(name, 0.0), conf)
-            print(f"[VOTE {self._scan_count}/{SCAN_FRAMES}]  {name} ({conf}%)  "
-                  f"votes={self._scan_votes[name]}")
+            # Immediate Success Branch
+            print(f"[RECOGNITION] WELCOME: {name} ({conf}%) on attempt {self._scan_count}")
+            self._door.open()
+            self._panels["WELCOME"].set_info(name, int(conf))
+            self._state_end = time.time() + DOOR_OPEN_SECS
+            self._enter("WELCOME")
+            return
+            
         else:
-            print(f"[VOTE {self._scan_count}/{SCAN_FRAMES}]  no match")
+            print(f"[RECOGNITION] Attempt {self._scan_count}/{SCAN_ATTEMPTS}: no match")
 
         # Not all passes done yet — keep scanning
-        if self._scan_count < SCAN_FRAMES:
+        if self._scan_count < SCAN_ATTEMPTS:
             return
 
-        # All passes done — make final decision
-        if self._scan_votes:
-            best_name  = max(self._scan_votes, key=self._scan_votes.get)
-            best_votes = self._scan_votes[best_name]
-            best_conf  = self._scan_confs.get(best_name, 0.0)
-            print(f"[VOTE RESULT] {best_name}: {best_votes}/{SCAN_FRAMES} votes")
-
-            if best_votes >= SCAN_MIN_VOTES:
-                print(f"WELCOME: {best_name} ({best_conf}%)")
-                self._door.open()
-                self._panels["WELCOME"].set_info(best_name, best_conf)
-                self._state_end = time.time() + DOOR_OPEN_SECS
-                self._enter("WELCOME")
-                return
-
-        print(f"DENIED: insufficient votes (needed {SCAN_MIN_VOTES}/{SCAN_FRAMES})")
+        # Out of attempts without a match
+        print(f"DENIED: 0 matches after {SCAN_ATTEMPTS} attempts")
         self._door.close()
         self._state_end = time.time() + DENIED_HOLD_SECS
         self._enter("DENIED")
@@ -1481,9 +1499,6 @@ class KioskWindow(QMainWindow):
         elif state == "ALIGN":
             self._last_scan = 0.0   # immediately re-check on next tick
         elif state == "SCANNING":
-            # Reset vote accumulators for a fresh session
-            self._scan_votes = {}
-            self._scan_confs = {}
             self._scan_count = 0
             self._scan_start = time.time()
 
