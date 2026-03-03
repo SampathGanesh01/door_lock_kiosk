@@ -634,6 +634,48 @@ class CountdownBar(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  State Panels
 # ═══════════════════════════════════════════════════════════════════════════════
+class StartupPanel(QWidget):
+    """Initial loading screen shown while deepface/retinaface loads in background."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background:{_BG};")
+        lay = QVBoxLayout(self)
+        
+        # Adding a massive top margin creates natural visual centering.
+        lay.addSpacing(_s(120))
+        
+        # Render the large SVG ASBL Logo in the centre
+        logo = QLabel()
+        pix = _load_logo_white(_s(240), _s(70))
+        if pix:
+            logo.setPixmap(pix)
+            logo.setAlignment(Qt.AlignCenter)
+        else:
+            logo.setText("A S B L")
+            logo.setFont(_font(48, True))
+            logo.setAlignment(Qt.AlignCenter)
+            logo.setStyleSheet("color: white;")
+        lay.addWidget(logo)
+
+        lay.addSpacing(_s(30))
+
+        # Welcome Subtext
+        welcome = QLabel("Welcome to ASBL Gym")
+        welcome.setFont(_font(22, True))
+        welcome.setStyleSheet("color: white; background:transparent;")
+        welcome.setAlignment(Qt.AlignCenter)
+        lay.addWidget(welcome)
+        
+        # Loading Indicator Text
+        self._status = QLabel("Loading AI Models...")
+        self._status.setFont(_font(14, False))
+        self._status.setStyleSheet(f"color: {_MUTED}; background:transparent;")
+        self._status.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._status)
+
+        lay.addStretch()
+
+
 class StandbyPanel(QWidget):
     """Branded idle screen — full screen, camera hidden, live clock."""
     def __init__(self, parent=None):
@@ -1134,7 +1176,7 @@ class AlignPanel(QWidget):
 # ===============================================================================
 #  Main Kiosk Window
 # ===============================================================================
-PANEL_IDX = {"STANDBY": 0, "SCANNING": 1, "WELCOME": 2, "DENIED": 3, "ALIGN": 4}
+PANEL_IDX = {"STARTUP": 0, "STANDBY": 1, "SCANNING": 2, "WELCOME": 3, "DENIED": 4, "ALIGN": 5}
 
 
 class KioskWindow(QMainWindow):
@@ -1143,7 +1185,7 @@ class KioskWindow(QMainWindow):
         self._door       = door
         self._recognizer = recognizer
         self._presence   = PresenceDetector()        # Layer-1: motion / presence trigger
-        self._state      = "STANDBY"
+        self._state      = "STARTUP"
         self._last_frame : np.ndarray | None = None
         self._last_faces : list = []
         self._last_scan  = 0.0
@@ -1185,6 +1227,7 @@ class KioskWindow(QMainWindow):
         # State panel stack fills the screen completely between header and footer
         self._stack = QStackedWidget()
         self._panels = {
+            "STARTUP":  StartupPanel(),
             "STANDBY":  StandbyPanel(),
             "SCANNING": ScanningPanel(self._cam_view),
             "WELCOME":  WelcomePanel(),
@@ -1262,8 +1305,17 @@ class KioskWindow(QMainWindow):
 
         now = time.time()
 
+        # ── STARTUP ────────────────────────────────────────────────────────────
+        if self._state == "STARTUP":
+            if self._recognizer.ready:
+                print("Models loaded, moving to STANDBY")
+                self._enter("STANDBY")
+            else:
+                # Discard frames while waiting for AI models to warm up in background
+                return
+
         # ── STANDBY ────────────────────────────────────────────────────────────
-        if self._state == "STANDBY":
+        elif self._state == "STANDBY":
             if now - self._last_scan >= SCAN_INTERVAL:
                 self._last_scan = now
 
