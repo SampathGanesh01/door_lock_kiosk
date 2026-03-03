@@ -486,10 +486,22 @@ class StandbyPanel(QWidget):
 
 
 class ScanningPanel(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, cam_view: QWidget, parent=None):
         super().__init__(parent)
         self.setStyleSheet(f"background:{_SCAN_BG};")
-        lay = QVBoxLayout(self)
+        
+        self.hlay = QHBoxLayout(self)
+        self.hlay.setSpacing(0); self.hlay.setContentsMargins(0,0,0,0)
+        
+        self.hlay.addWidget(cam_view, 65)
+        
+        sep = QWidget()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet(f"background:{_BORDER};")
+        self.hlay.addWidget(sep)
+        
+        right_container = QWidget()
+        lay = QVBoxLayout(right_container)
         lay.setSpacing(10); lay.setContentsMargins(24, 28, 24, 20)
 
         lay.addStretch(1)
@@ -501,6 +513,8 @@ class ScanningPanel(QWidget):
         lay.addWidget(_lbl("IDENTIFYING", 18, True, _SCAN))
         lay.addWidget(_lbl("Please hold still…", 11, False, _MUTED))
         lay.addSpacing(16)
+        
+        self.hlay.addWidget(right_container, 35)
 
 
 class WelcomePanel(QWidget):
@@ -742,33 +756,20 @@ class KioskWindow(QMainWindow):
 
         vlay.addWidget(HeaderBar())
 
-        # Content row — horizontal split: camera | separator | state-panel
-        content = QWidget()
-        self._hlay = QHBoxLayout(content)
-        self._hlay.setSpacing(0); self._hlay.setContentsMargins(0,0,0,0)
-
-        # Camera view (65%) — hidden during STANDBY / WELCOME / DENIED
         self._cam_view = CameraView()
-        self._hlay.addWidget(self._cam_view, 65)
 
-        # Vertical separator — also hidden when camera is hidden
-        self._sep = QWidget(); self._sep.setFixedWidth(1)
-        self._sep.setStyleSheet(f"background:{_BORDER};")
-        self._hlay.addWidget(self._sep)
-
-        # State panel stack
+        # State panel stack fills the screen completely between header and footer
         self._stack = QStackedWidget()
         self._panels = {
             "STANDBY":  StandbyPanel(),
-            "SCANNING": ScanningPanel(),
+            "SCANNING": ScanningPanel(self._cam_view),
             "WELCOME":  WelcomePanel(),
             "DENIED":   DeniedPanel(),
         }
         for key, panel in self._panels.items():
             self._stack.addWidget(panel)
-        self._hlay.addWidget(self._stack, 35)
-
-        vlay.addWidget(content, 1)
+            
+        vlay.addWidget(self._stack, 1)
         vlay.addWidget(FooterBar())
 
         # ── Camera thread ────────────────────────────────────────────────────
@@ -877,20 +878,6 @@ class KioskWindow(QMainWindow):
     def _enter(self, state: str):
         self._state = state
         self._stack.setCurrentIndex(PANEL_IDX[state])
-
-        show_cam = (state == "SCANNING")
-        self._cam_view.setVisible(show_cam)
-        self._sep.setVisible(show_cam)
-
-        # ★ Critical: Qt keeps the stretch-factor allocation (65/35) even when
-        #   the camera widget is hidden, leaving the stack in only 35% width.
-        #   Explicitly set stretch to 0/100 so the stack fills the full screen.
-        if show_cam:
-            self._hlay.setStretchFactor(self._cam_view, 65)
-            self._hlay.setStretchFactor(self._stack, 35)
-        else:
-            self._hlay.setStretchFactor(self._cam_view, 0)
-            self._hlay.setStretchFactor(self._stack, 100)
 
         if state == "STANDBY":
             self._last_scan = 0.0
