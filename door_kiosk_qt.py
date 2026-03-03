@@ -20,13 +20,15 @@ Usage
 from __future__ import annotations
 import cv2, json, numpy as np
 import os, sys, time, math, signal, atexit, threading, argparse, warnings, logging, queue
+import urllib.request, urllib.error
+from datetime import datetime
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel,
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QHBoxLayout, QVBoxLayout, QStackedWidget, QSizePolicy,
 )
 from PySide6.QtCore  import Qt, QTimer, QThread, Signal, QRectF, QPointF
@@ -78,8 +80,7 @@ _SCALE: float = 1.0
 
 def _s(n: int | float) -> int:
     """Scale a pixel value by the current screen scale factor."""
-    return max(1, int(n * _SCALE))
-
+    return max(1, int((n * 1.4) * _SCALE))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CLI args
@@ -460,7 +461,7 @@ class StandbyPanel(QWidget):
         outer.addSpacing(_s(20))
 
         # ── Title + invitation ───────────────────────────────────────────────
-        outer.addWidget(_lbl("Welcome to ASBL Homes GYM", 26, True, _TEXT))
+        outer.addWidget(_lbl("Welcome to ASBL GYM", 26, True, _TEXT))
         outer.addSpacing(_s(6))
         outer.addWidget(_lbl("Please stand in front of the camera", 13, False, _MUTED))
         outer.addSpacing(_s(12))
@@ -665,9 +666,90 @@ class CameraView(QLabel):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Background API Sync
+# ═══════════════════════════════════════════════════════════════════════════════
+class ApiSyncWorker(QThread):
+    sync_completed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+
+    def run(self):
+        url = "https://testasbl.sarvamsync.com/api/faces"
+        while self._running:
+            try:
+                # print("🔄 Syncing from API...")
+                req = urllib.request.Request(url, headers={'accept': 'application/json'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = response.read()
+                    api_data = json.loads(data)
+
+                # Load current faces
+                local_data = {}
+                if os.path.exists(FACES_DB):
+                    with open(FACES_DB, 'r') as f:
+                        local_data = json.load(f)
+
+                # Load deleted faces (if we want to append)
+                deleted_data = {}
+                if os.path.exists("deleted_faces.json"):
+                    with open("deleted_faces.json", 'r') as f:
+                        deleted_data = json.load(f)
+
+                changed = False
+                
+                # Check for additions/updates
+                for name, info in api_data.items():
+                    if name not in local_data:
+                        local_data[name] = info
+                        changed = True
+                    else:
+                        # Compare embeddings length as a simple check
+                        if len(info.get("embeddings", [])) != len(local_data[name].get("embeddings", [])):
+                            local_data[name] = info
+                            changed = True
+
+                # Check for deletions
+                to_delete = []
+                for name in local_data.keys():
+                    if name not in api_data:
+                        to_delete.append(name)
+                        changed = True
+
+                for name in to_delete:
+                    deleted_data[name] = local_data.pop(name)
+
+                if changed:
+                    print("💾 Saving updated faces to disk...")
+                    with open(FACES_DB, 'w') as f:
+                        json.dump(local_data, f)
+                    with open("deleted_faces.json", 'w') as f:
+                        json.dump(deleted_data, f)
+
+                # Emit success with timestamp
+                now = datetime.now().strftime("%I:%M %p")
+                self.sync_completed.emit(f"Last Sync: {now}")
+
+            except Exception as e:
+                print(f"⚠️ Sync failed: {e}")
+
+            # Sleep 5 seconds, checking self._running every 0.5s for fast shutdown
+            for _ in range(10):
+                if not self._running:
+                    break
+                time.sleep(0.5)
+
+    def stop(self):
+        self._running = False
+        self.wait(3000)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Header + Footer
 # ═══════════════════════════════════════════════════════════════════════════════
 class HeaderBar(QWidget):
+    manual_sync_requested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(_s(58))
@@ -688,6 +770,24 @@ class HeaderBar(QWidget):
         self._clock.setStyleSheet(f"color:{_MUTED}; background:transparent;")
         self._clock.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row.addWidget(self._clock)
+        
+        row.addSpacing(_s(15))
+
+        self.sync_btn = QPushButton("Sync Now")
+        self.sync_btn.setFont(_font(12, True))
+        self.sync_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {_ACCENT};
+                color: white;
+                border-radius: {_s(4)}px;
+                padding: {_s(6)}px {_s(12)}px;
+            }}
+            QPushButton:pressed {{
+                background: {_SCAN};
+            }}
+        """)
+        self.sync_btn.clicked.connect(self.manual_sync_requested.emit)
+        row.addWidget(self.sync_btn)
 
         self._tick()
         t = QTimer(self); t.timeout.connect(self._tick); t.start(1000)
@@ -706,6 +806,11 @@ class FooterBar(QWidget):
         row = QHBoxLayout(self)
         row.setContentsMargins(_s(22), 0, _s(22), 0)
 
+        self._sync_status = QLabel("Last Sync: --")
+        self._sync_status.setFont(_font(11, False))
+        self._sync_status.setStyleSheet(f"color:{_MUTED}; background:transparent;")
+        row.addWidget(self._sync_status)
+
         # Centre: stretch + logo + label + stretch
         row.addStretch()
         pix = _load_logo_white(_s(80), _s(24))
@@ -720,6 +825,9 @@ class FooterBar(QWidget):
         powered.setStyleSheet(f"color:{_TEXT}; background:transparent;")
         row.addWidget(powered)
         row.addStretch()
+
+    def set_sync_status(self, text: str):
+        self._sync_status.setText(text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -754,7 +862,9 @@ class KioskWindow(QMainWindow):
         root.setStyleSheet(f"background:{_BG};")
         vlay = QVBoxLayout(root); vlay.setSpacing(0); vlay.setContentsMargins(0,0,0,0)
 
-        vlay.addWidget(HeaderBar())
+        self._header = HeaderBar()
+        self._header.manual_sync_requested.connect(self._force_sync)
+        vlay.addWidget(self._header)
 
         self._cam_view = CameraView()
 
@@ -770,7 +880,14 @@ class KioskWindow(QMainWindow):
             self._stack.addWidget(panel)
             
         vlay.addWidget(self._stack, 1)
-        vlay.addWidget(FooterBar())
+
+        self._footer = FooterBar()
+        vlay.addWidget(self._footer)
+
+        # ── API Sync thread ──────────────────────────────────────────────────
+        self._api_worker = ApiSyncWorker()
+        self._api_worker.sync_completed.connect(self._on_sync_completed)
+        self._api_worker.start()
 
         # ── Camera thread ────────────────────────────────────────────────────
         self._cam_thread = CameraThread(cam_index)
@@ -785,6 +902,22 @@ class KioskWindow(QMainWindow):
     # ── Frame receiver ────────────────────────────────────────────────────────
     def _on_frame(self, frame: np.ndarray):
         self._last_frame = frame
+
+    def _on_sync_completed(self, status: str):
+        self._footer.set_sync_status(status)
+
+    def _force_sync(self):
+        # The worker is already running every 5 seconds, but to make the button
+        # feel responsive immediately without managing threading locks tightly,
+        # we restart the worker loop
+        self._header.sync_btn.setText("Syncing...")
+        self._header.sync_btn.setEnabled(False)
+        self._api_worker.stop()
+        self._api_worker = ApiSyncWorker()
+        self._api_worker.sync_completed.connect(self._on_sync_completed)
+        self._api_worker.start()
+        QTimer.singleShot(1000, lambda: self._header.sync_btn.setText("Sync Now"))
+        QTimer.singleShot(1000, lambda: self._header.sync_btn.setEnabled(True))
 
     # ── Main state-machine tick ───────────────────────────────────────────────
     def _tick(self):
@@ -892,6 +1025,7 @@ class KioskWindow(QMainWindow):
         print("\n🧹  Shutting down kiosk…")
         self._timer.stop()
         self._cam_thread.stop()
+        self._api_worker.stop()
         self._door.cleanup()
         self._recognizer.stop()
         QApplication.restoreOverrideCursor()
