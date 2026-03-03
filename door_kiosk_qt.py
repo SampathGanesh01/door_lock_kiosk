@@ -1134,6 +1134,11 @@ class KioskWindow(QMainWindow):
         self._reco_busy  = False
         self._result_q   : queue.Queue = queue.Queue()
 
+        # ── Background detection state ───────────────────────────────────────
+        self._detect_busy = False
+        self._detect_q    : queue.Queue = queue.Queue()
+        self._current_faces: list = []
+
         # -- Window flags: frameless + always on top ----------------------------
         self.setWindowFlags(
             Qt.Window |
@@ -1221,6 +1226,14 @@ class KioskWindow(QMainWindow):
         except queue.Empty:
             pass
 
+        # Check for detection result from background thread
+        try:
+            faces = self._detect_q.get_nowait()
+            self._detect_busy = False
+            self._current_faces = faces
+        except queue.Empty:
+            pass
+
         now = time.time()
 
         # ── STANDBY ────────────────────────────────────────────────────────────
@@ -1233,8 +1246,11 @@ class KioskWindow(QMainWindow):
                     self._last_presence = now
                     H, W = frame.shape[:2]
 
+                    if not self._detect_busy:
+                        self._run_detection(frame)
+
                     # Layer 2 — AOI gate: only face centres inside the zone
-                    faces = self._recognizer.detect_faces(frame)
+                    faces = self._current_faces
                     aoi_faces = [
                         f for f in faces
                         if is_face_in_aoi(f[0], f[1], f[2], f[3], W, H)
@@ -1270,7 +1286,11 @@ class KioskWindow(QMainWindow):
 
                 if self._presence.detect(frame):
                     self._last_presence = now
-                    faces = self._recognizer.detect_faces(frame)
+                    
+                    if not self._detect_busy:
+                        self._run_detection(frame)
+                    
+                    faces = self._current_faces
                     aoi_faces = [
                         f for f in faces
                         if is_face_in_aoi(f[0], f[1], f[2], f[3], W, H)
@@ -1353,6 +1373,23 @@ class KioskWindow(QMainWindow):
             self._enter("ALIGN")
 
 
+
+    # ── Detection in background thread ───────────────────────────────────────
+    def _run_detection(self, frame: np.ndarray):
+        if self._detect_busy:
+            return
+        self._detect_busy = True
+        
+        q = self._detect_q
+        recognizer = self._recognizer
+        # pass a copy of the frame to prevent it from mutating while thread runs
+        frame_copy = frame.copy()
+
+        def work():
+            faces = recognizer.detect_faces(frame_copy)
+            q.put(faces)
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ── Recognition in background thread ─────────────────────────────────────
     def _run_recognition(self, frame: np.ndarray):
