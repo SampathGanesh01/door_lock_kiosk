@@ -72,6 +72,15 @@ PRESENCE_COOLDOWN = 3.0    # seconds of no motion → hide guide, stay STANDBY
 # ── Debug overlay ──────────────────────────────────────────────────────────────
 DEBUG_AOI = False   # set True to always draw AOI box for physical alignment tuning
 
+# ── Multi-frame voting ─────────────────────────────────────────────────────────
+# ArcFace runs SCAN_FRAMES times per session; a name needs SCAN_MIN_VOTES
+# matching results to be accepted. This eliminates single-frame false positives
+# caused by blinks, slight angles, or motion blur.
+SCAN_FRAMES      = 5     # recognition passes per SCANNING session
+SCAN_MIN_VOTES   = 3     # minimum matching votes required to grant access (3/5)
+SCANNING_TIMEOUT = 5.0   # seconds max in SCANNING before giving up (→ DENIED)
+
+
 # ── Qt colours ────────────────────────────────────────────────────────────────
 _BG       = "#0a0a1a"
 _HEADER   = "#0c0c24"
@@ -176,18 +185,29 @@ class FaceRecognizer:
     def _load(self):
         if self._stop.is_set():
             return
-        print("🔄  Loading ArcFace model in background…")
+        print("Loading ArcFace + RetinaFace models in background…")
         from deepface import DeepFace as DF
         self._DeepFace = DF
+        # ── Warm up ArcFace (recognition model) ────────────────────────────
         try:
             DF.represent(np.zeros((112, 112, 3), np.uint8),
                          model_name=RECOGNITION_MODEL,
                          enforce_detection=False, detector_backend="skip")
         except Exception:
             pass
+        # ── Warm up RetinaFace (detection model) ───────────────────────────
+        # This prevents a 1-2s cold-start on the first real detect_faces() call.
+        try:
+            DF.extract_faces(np.zeros((320, 240, 3), np.uint8),
+                             detector_backend="retinaface",
+                             enforce_detection=False, align=False)
+            print("  RetinaFace ready.")
+        except Exception as e:
+            print(f"  RetinaFace warmup skipped: {e}")
         if not self._stop.is_set():
             self._ready = True
-            print("✅  ArcFace ready.")
+            print("ArcFace ready.")
+
 
     def stop(self):
         self._stop.set()
@@ -197,6 +217,34 @@ class FaceRecognizer:
         return self._ready
 
     def detect_faces(self, frame):
+        """Detect faces in a BGR frame. Returns list of (x, y, w, h) tuples.
+
+        Uses RetinaFace when the model is loaded (accurate, handles angles),
+        falls back to Haar cascade during startup (fast but less accurate).
+        RetinaFace confidence gate at 0.70 eliminates near-false-positive blobs.
+        """
+        if self._ready and self._DeepFace is not None:
+            try:
+                faces = self._DeepFace.extract_faces(
+                    img_path=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                    detector_backend="retinaface",
+                    enforce_detection=False,
+                    align=False,   # just bounding boxes, not aligned crops
+                )
+                rects = []
+                for f in faces:
+                    # Skip low-confidence detections (lighting artefacts, partial faces)
+                    if f.get("confidence", 1.0) < 0.70:
+                        continue
+                    region = f["facial_area"]
+                    x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+                    if w >= MIN_FACE_PIXELS:
+                        rects.append((x, y, w, h))
+                return rects
+            except Exception as e:
+                print(f"  [RetinaFace] fallback to Haar: {e}")
+
+        # Fallback: Haar cascade (used during model startup)
         gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         rects = self._cascade.detectMultiScale(
             gray, scaleFactor=1.12, minNeighbors=5,
@@ -204,27 +252,39 @@ class FaceRecognizer:
         )
         return list(rects) if len(rects) else []
 
+
     def embed(self, bgr_crop):
         """Generate a 512-D ArcFace embedding from a BGR face crop.
 
-        align=True is CRITICAL and must match the server-side setting.
-        A mismatch between aligned and non-aligned embeddings produces high
-        cosine distances even for the same person, causing everyone to be denied.
+        Added dynamic alignment + blur check:
+        1. Rejects blurry frames instantly using Laplacian variance.
+        2. Passes the expanded crop into RetinaFace, allowing DeepFace to
+           find the eyes dynamically and enforce server-matching geometry
+           via align=True.
         """
         if not self._ready:
             return None
+
+        # ── 1. Blur Check ──────────────────────────────────────────────────────────
+        gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if blur_score < 40.0:
+            print(f"  [Embed] Frame blurry ({blur_score:.1f} < 40) — skipping pass")
+            return None
+
+        # ── 2. Dynamic Alignment + Embedding ───────────────────────────────────────
         try:
             res = self._DeepFace.represent(
                 img_path=cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB),
                 model_name=RECOGNITION_MODEL,
                 enforce_detection=False,
-                detector_backend="skip",
-                align=True,   # MUST match server: both use align=True
+                detector_backend="retinaface", # Let RetinaFace align the eyes
+                align=True,   # CRITICAL: matches server
             )
             if res and "embedding" in res[0]:
                 return np.array(res[0]["embedding"], dtype=np.float32)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [Embed error] {e}")
         return None
 
     @staticmethod
@@ -1064,6 +1124,12 @@ class KioskWindow(QMainWindow):
         self._last_faces : list = []
         self._last_scan  = 0.0
         self._last_presence = 0.0                    # timestamp of last detected motion
+        # ── Multi-frame voting state ─────────────────────────────────────────
+        self._scan_votes : dict  = {}    # {name: vote_count}
+        self._scan_confs : dict  = {}    # {name: best_confidence}
+        self._scan_count : int   = 0     # recognition passes completed this session
+        self._scan_start : float = 0.0   # when SCANNING state was entered
+
         self._state_end  = 0.0
         self._reco_busy  = False
         self._result_q   : queue.Queue = queue.Queue()
@@ -1227,11 +1293,35 @@ class KioskWindow(QMainWindow):
 
         # ── SCANNING ───────────────────────────────────────────────────────────
         elif self._state == "SCANNING":
+            # Safety: timeout — if stuck too long, go to DENIED
+            if now - self._scan_start > SCANNING_TIMEOUT:
+                print(f"[VOTE] Timeout after {SCANNING_TIMEOUT}s — DENIED")
+                self._door.close()
+                self._state_end = now + DENIED_HOLD_SECS
+                self._enter("DENIED")
+                return
+
+            # Fire the next recognition pass while votes are still needed
+            if not self._reco_busy and self._scan_count < SCAN_FRAMES:
+                self._run_recognition(frame)
+
+            # Live display: face box + AOI overlay + vote progress text
             display = frame.copy()
             for (fx, fy, fw, fh) in self._last_faces:
                 draw_corner_box(display, fx, fy, fx+fw, fy+fh, _CV_CYAN, t=3)
-            draw_aoi_overlay(display, state="ready")   # green "Hold still" overlay
+            draw_aoi_overlay(display, state="ready")
+
+            # Vote progress bar drawn at bottom-left
+            H, W = display.shape[:2]
+            bar_w = int(W * 0.35)
+            progress = int(bar_w * (self._scan_count / max(SCAN_FRAMES, 1)))
+            cv2.rectangle(display, (20, H - 38), (20 + bar_w, H - 18), (60, 60, 60), -1)
+            cv2.rectangle(display, (20, H - 38), (20 + progress, H - 18), (50, 220, 80), -1)
+            label = f"Scan {self._scan_count}/{SCAN_FRAMES}"
+            cv2.putText(display, label, (22, H - 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
             self._cam_view.set_frame(display)
+
 
         # ── WELCOME ────────────────────────────────────────────────────────────
         elif self._state == "WELCOME":
@@ -1271,9 +1361,16 @@ class KioskWindow(QMainWindow):
         self._reco_busy = True
 
         fx, fy, fw, fh = max(self._last_faces, key=lambda r: r[2] * r[3])
-        pad = 30
+        
+        # ── Dynamic Tracking Pad ───────────────────────────────────────────────────
+        # In SCANNING state, self._last_faces is frozen from the ALIGN trigger.
+        # By passing a generous 100px padded crop to RetinaFace down the line,
+        # RetinaFace can easily find the person's new location if they swayed or 
+        # stepped forward during the 1-2 second multi-frame scanning process.
+        pad = 100
         H, W = frame.shape[:2]
         crop = frame[max(fy-pad,0):min(fy+fh+pad,H), max(fx-pad,0):min(fx+fw+pad,W)]
+
 
         q = self._result_q
         recognizer = self._recognizer
@@ -1290,18 +1387,51 @@ class KioskWindow(QMainWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_recognition_result(self, name, conf):
+    def _on_recognition_result(self, name: str | None, conf: float):
+        """Accumulate one recognition pass and decide after SCAN_FRAMES results.
+
+        Decision logic:
+          - Collect up to SCAN_FRAMES ArcFace results.
+          - A name wins only if it gets >= SCAN_MIN_VOTES votes (majority).
+          - If no name reaches the threshold → DENIED.
+          - Best confidence across winning passes is shown in WELCOME.
+        """
+        # Accumulate this pass
+        self._scan_count += 1
         if name:
-            print(f"✅  Recognised: {name} ({conf}%)")
-            self._door.open()
-            self._panels["WELCOME"].set_info(name, conf)
-            self._state_end = time.time() + DOOR_OPEN_SECS
-            self._enter("WELCOME")
+            self._scan_votes[name] = self._scan_votes.get(name, 0) + 1
+            # Keep the best (highest) confidence for this name
+            self._scan_confs[name] = max(self._scan_confs.get(name, 0.0), conf)
+            print(f"[VOTE {self._scan_count}/{SCAN_FRAMES}]  {name} ({conf}%)  "
+                  f"votes={self._scan_votes[name]}")
         else:
-            print("❌  Not recognised.")
-            self._door.close()
-            self._state_end = time.time() + DENIED_HOLD_SECS
-            self._enter("DENIED")
+            print(f"[VOTE {self._scan_count}/{SCAN_FRAMES}]  no match")
+
+        # Not all passes done yet — keep scanning
+        if self._scan_count < SCAN_FRAMES:
+            return
+
+        # All passes done — make final decision
+        if self._scan_votes:
+            best_name  = max(self._scan_votes, key=self._scan_votes.get)
+            best_votes = self._scan_votes[best_name]
+            best_conf  = self._scan_confs.get(best_name, 0.0)
+            print(f"[VOTE RESULT] {best_name}: {best_votes}/{SCAN_FRAMES} votes")
+
+            if best_votes >= SCAN_MIN_VOTES:
+                print(f"WELCOME: {best_name} ({best_conf}%)")
+                self._door.open()
+                self._panels["WELCOME"].set_info(best_name, best_conf)
+                self._state_end = time.time() + DOOR_OPEN_SECS
+                self._enter("WELCOME")
+                return
+
+        print(f"DENIED: insufficient votes (needed {SCAN_MIN_VOTES}/{SCAN_FRAMES})")
+        self._door.close()
+        self._state_end = time.time() + DENIED_HOLD_SECS
+        self._enter("DENIED")
+
+
 
     # ── State transition ──────────────────────────────────────────────────────
     def _enter(self, state: str):
@@ -1313,6 +1443,13 @@ class KioskWindow(QMainWindow):
             self._last_presence = 0.0
         elif state == "ALIGN":
             self._last_scan = 0.0   # immediately re-check on next tick
+        elif state == "SCANNING":
+            # Reset vote accumulators for a fresh session
+            self._scan_votes = {}
+            self._scan_confs = {}
+            self._scan_count = 0
+            self._scan_start = time.time()
+
 
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
