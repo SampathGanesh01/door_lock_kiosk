@@ -679,60 +679,102 @@ class ApiSyncWorker(QThread):
         url = "https://testasbl.sarvamsync.com/api/faces"
         while self._running:
             try:
-                # print("🔄 Syncing from API...")
+                print("🔄 Syncing from API...")
                 req = urllib.request.Request(url, headers={'accept': 'application/json'})
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = response.read()
-                    api_data = json.loads(data)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    raw = response.read()
+                    api_response = json.loads(raw)
 
-                # Load current faces
+                # API returns: {"faces": [{name, user_id, samples, face_b64}, ...], "total": N}
+                api_faces_list = api_response.get("faces", [])
+
+                # Build a lookup dict keyed by user_id for stable comparison
+                # {user_id: {name, user_id, samples, face_b64}}
+                api_by_uid = {str(face["user_id"]): face for face in api_faces_list}
+
+                # Load current local faces.json
+                # Format: {name: {embeddings: [...], user_id: ..., samples: ..., ...}}
                 local_data = {}
                 if os.path.exists(FACES_DB):
                     with open(FACES_DB, 'r') as f:
                         local_data = json.load(f)
 
-                # Load deleted faces (if we want to append)
+                # Build a lookup of local entries by user_id
+                local_by_uid = {}
+                for local_name, local_info in local_data.items():
+                    uid = str(local_info.get("user_id", ""))
+                    if uid:
+                        local_by_uid[uid] = local_name
+
+                # Load deleted faces archive
                 deleted_data = {}
                 if os.path.exists("deleted_faces.json"):
                     with open("deleted_faces.json", 'r') as f:
                         deleted_data = json.load(f)
 
                 changed = False
-                
-                # Check for additions/updates
-                for name, info in api_data.items():
-                    if name not in local_data:
-                        local_data[name] = info
+
+                # ── Check for additions / updates ──────────────────────────
+                for uid, api_face in api_by_uid.items():
+                    api_name    = api_face["name"]
+                    api_samples = int(api_face.get("samples", 0))
+
+                    if uid not in local_by_uid:
+                        # Brand-new person — add them (embeddings fetched separately or empty)
+                        print(f"➕ New person detected: {api_name} (uid={uid})")
+                        local_data[api_name] = {
+                            "user_id":    uid,
+                            "samples":    api_samples,
+                            "embeddings": [],   # embeddings are built locally by the kiosk
+                        }
+                        local_by_uid[uid] = api_name
                         changed = True
                     else:
-                        # Compare embeddings length as a simple check
-                        if len(info.get("embeddings", [])) != len(local_data[name].get("embeddings", [])):
-                            local_data[name] = info
+                        # Person exists — check if sample count changed (means new embeddings added)
+                        local_name = local_by_uid[uid]
+                        local_info = local_data[local_name]
+                        local_samples = int(local_info.get("samples", 0))
+
+                        if api_samples != local_samples:
+                            print(f"🔄 Updated samples for {api_name}: {local_samples} → {api_samples}")
+                            local_data[local_name]["samples"] = api_samples
+                            # If name changed too, rename the entry
+                            if local_name != api_name:
+                                local_data[api_name] = local_data.pop(local_name)
+                                local_by_uid[uid] = api_name
+                            changed = True
+                        elif local_name != api_name:
+                            # Name changed but samples same — rename in place
+                            print(f"✏️ Name changed: {local_name} → {api_name}")
+                            local_data[api_name] = local_data.pop(local_name)
+                            local_by_uid[uid] = api_name
                             changed = True
 
-                # Check for deletions
-                to_delete = []
-                for name in local_data.keys():
-                    if name not in api_data:
-                        to_delete.append(name)
-                        changed = True
-
-                for name in to_delete:
-                    deleted_data[name] = local_data.pop(name)
+                # ── Check for deletions ────────────────────────────────────
+                to_delete_uids = [uid for uid in local_by_uid if uid not in api_by_uid]
+                for uid in to_delete_uids:
+                    local_name = local_by_uid[uid]
+                    print(f"🗑️ Person removed from server: {local_name} (uid={uid}) → deleted_faces.json")
+                    deleted_data[local_name] = local_data.pop(local_name)
+                    changed = True
 
                 if changed:
-                    print("💾 Saving updated faces to disk...")
+                    print(f"💾 Saving updated faces.json ({len(local_data)} persons)")
                     with open(FACES_DB, 'w') as f:
-                        json.dump(local_data, f)
+                        json.dump(local_data, f, indent=2)
                     with open("deleted_faces.json", 'w') as f:
-                        json.dump(deleted_data, f)
+                        json.dump(deleted_data, f, indent=2)
+                else:
+                    print(f"✅ Faces up-to-date ({len(local_data)} persons, no changes)")
 
                 # Emit success with timestamp
                 now = datetime.now().strftime("%I:%M %p")
                 self.sync_completed.emit(f"Last Sync: {now}")
 
             except Exception as e:
+                import traceback
                 print(f"⚠️ Sync failed: {e}")
+                traceback.print_exc()
 
             # Sleep 5 seconds, checking self._running every 0.5s for fast shutdown
             for _ in range(10):
