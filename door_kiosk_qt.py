@@ -54,6 +54,24 @@ DOOR_OPEN_SECS    = 5
 DENIED_HOLD_SECS  = 3
 TICK_MS           = 33          # ~30 fps
 
+# ── Area of Interest (AOI) ─────────────────────────────────────────────────────
+# Fractions of the full frame that define the centre recognition zone.
+# A face whose CENTRE POINT falls inside this box is eligible for ArcFace.
+# Adjust these to match your real kiosk camera angle / mounting height.
+AOI_X_FRAC   = 0.25   # left edge of AOI  (25 % from left)
+AOI_Y_FRAC   = 0.10   # top  edge of AOI  (10 % from top)
+AOI_W_FRAC   = 0.50   # width of AOI zone (centre 50 % of frame)
+AOI_H_FRAC   = 0.80   # height of AOI zone (centre 80 % of frame)
+AOI_MIN_FACE = 90     # minimum face width in pixels  (person too far → skip)
+
+# ── Motion / Presence detection ────────────────────────────────────────────────
+MOTION_THRESHOLD  = 25     # MOG2 pixel-diff sensitivity  (lower = more sensitive)
+MOTION_MIN_AREA   = 3000   # min contour area (px²) at full resolution
+PRESENCE_COOLDOWN = 3.0    # seconds of no motion → hide guide, stay STANDBY
+
+# ── Debug overlay ──────────────────────────────────────────────────────────────
+DEBUG_AOI = False   # set True to always draw AOI box for physical alignment tuning
+
 # ── Qt colours ────────────────────────────────────────────────────────────────
 _BG       = "#0a0a1a"
 _HEADER   = "#0c0c24"
@@ -234,6 +252,39 @@ class FaceRecognizer:
         return None, 0
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Presence / Motion Detector
+# ═══════════════════════════════════════════════════════════════════════════════
+class PresenceDetector:
+    """Layer-1 cheap trigger: detect ANY human / motion in the entire frame.
+
+    Uses MOG2 background subtraction (built-in OpenCV, no extra model).
+    When motion is detected the state machine advances to Layer-2 (AOI check).
+    This avoids running Haar cascade + ArcFace on every idle frame.
+    """
+
+    def __init__(self):
+        self._bg = cv2.createBackgroundSubtractorMOG2(
+            history=120,
+            varThreshold=MOTION_THRESHOLD,
+            detectShadows=False,
+        )
+        self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    def detect(self, frame: np.ndarray) -> bool:
+        """Return True if significant movement / presence found anywhere in frame."""
+        # Downscale for speed; motion area is scaled back afterwards
+        small  = cv2.resize(frame, (320, 240))
+        mask   = self._bg.apply(small)
+        mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Scale-up factor so area threshold is resolution-independent
+        scale = (frame.shape[1] / 320.0) * (frame.shape[0] / 240.0)
+        return any(cv2.contourArea(c) * scale >= MOTION_MIN_AREA for c in cnts)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  OpenCV overlay helpers
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -243,6 +294,75 @@ def draw_corner_box(img, x1, y1, x2, y2, color, t=3, L=30):
                 ((x1,y2),(x1+L,y2)), ((x1,y2),(x1,y2-L)),
                 ((x2,y2),(x2-L,y2)), ((x2,y2),(x2,y2-L))]:
         cv2.line(img, pts[0], pts[1], color, t, cv2.LINE_AA)
+
+
+# ── AOI helpers ───────────────────────────────────────────────────────────────
+
+def _aoi_rect(frame_w: int, frame_h: int) -> tuple:
+    """Return (x1, y1, x2, y2) of the AOI rectangle in pixel coords."""
+    x1 = int(frame_w * AOI_X_FRAC)
+    y1 = int(frame_h * AOI_Y_FRAC)
+    x2 = int(frame_w * (AOI_X_FRAC + AOI_W_FRAC))
+    y2 = int(frame_h * (AOI_Y_FRAC + AOI_H_FRAC))
+    return x1, y1, x2, y2
+
+
+def is_face_in_aoi(fx: int, fy: int, fw: int, fh: int,
+                   frame_w: int, frame_h: int) -> bool:
+    """Layer-2 gate: True only when the face centre falls inside the AOI zone
+    AND the face is large enough (person close enough to camera).
+
+    Two conditions must both be met:
+      1. Face centre (cx, cy) is within the central AOI rectangle
+      2. Face width >= AOI_MIN_FACE pixels (not too far away)
+    """
+    cx = fx + fw // 2
+    cy = fy + fh // 2
+    x1, y1, x2, y2 = _aoi_rect(frame_w, frame_h)
+    in_zone    = x1 <= cx <= x2 and y1 <= cy <= y2
+    close_enough = fw >= AOI_MIN_FACE
+    return in_zone and close_enough
+
+
+def draw_aoi_overlay(frame: np.ndarray, state: str = "wait"):
+    """Draw the AOI guide box + instruction text on the live camera frame.
+
+    state: 'wait'  → amber box, "Step into the frame"
+           'ready' → green box, "Hold still — scanning…"
+           'debug' → blue box, used when DEBUG_AOI=True in STANDBY
+    """
+    H, W = frame.shape[:2]
+    x1, y1, x2, y2 = _aoi_rect(W, H)
+
+    # Colour per state
+    if state == "ready":
+        color = (50, 220, 80)    # green: face in AOI, scanning
+        label = "Hold still \u2014 scanning\u2026"
+    elif state == "debug":
+        color = (200, 120, 20)   # blue tint: debug info only
+        label = f"AOI DEBUG  [{x1},{y1}]\u2192[{x2},{y2}]"
+    else:
+        color = (30, 140, 220)   # amber: guide the user
+        label = "Step into the frame"
+
+    # Semi-transparent fill inside AOI
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, 0.06, frame, 0.94, 0, frame)  # very subtle tint
+
+    # Corner bracket border
+    draw_corner_box(frame, x1, y1, x2, y2, color, t=3, L=40)
+
+    # Centred text below the AOI box
+    font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 0.70, 2
+    (tw, th), _ = cv2.getTextSize(label, font, fs, ft)
+    tx = max(0, (W - tw) // 2)
+    ty = min(H - 10, y2 + th + 14)
+    # Drop shadow
+    cv2.putText(frame, label, (tx + 1, ty + 1), font, fs, (0, 0, 0), ft + 1, cv2.LINE_AA)
+    cv2.putText(frame, label, (tx, ty),         font, fs, color,      ft,     cv2.LINE_AA)
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -910,25 +1030,45 @@ class FooterBar(QWidget):
         self._sync_status.setText(text)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
+#  Align Panel
+# ===============================================================================
+class AlignPanel(QWidget):
+    """Fifth state: shows live camera + AOI guide overlay.
+
+    Appears when motion is detected anywhere but face is not yet in the central
+    AOI zone. Guides the user to step into position without triggering ArcFace.
+    """
+    def __init__(self, cam_view: QWidget, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background:{_BG};")
+        lay = QVBoxLayout(self)
+        lay.setSpacing(0); lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(cam_view, 1)   # full-screen camera fill
+
+
+# ===============================================================================
 #  Main Kiosk Window
-# ═══════════════════════════════════════════════════════════════════════════════
-PANEL_IDX = {"STANDBY": 0, "SCANNING": 1, "WELCOME": 2, "DENIED": 3}
+# ===============================================================================
+PANEL_IDX = {"STANDBY": 0, "SCANNING": 1, "WELCOME": 2, "DENIED": 3, "ALIGN": 4}
+
 
 class KioskWindow(QMainWindow):
     def __init__(self, door: DoorController, recognizer: FaceRecognizer, cam_index: int):
         super().__init__()
         self._door       = door
         self._recognizer = recognizer
+        self._presence   = PresenceDetector()        # Layer-1: motion / presence trigger
         self._state      = "STANDBY"
         self._last_frame : np.ndarray | None = None
         self._last_faces : list = []
         self._last_scan  = 0.0
+        self._last_presence = 0.0                    # timestamp of last detected motion
         self._state_end  = 0.0
         self._reco_busy  = False
         self._result_q   : queue.Queue = queue.Queue()
 
-        # ── Window flags: frameless + always on top ──────────────────────────
+        # -- Window flags: frameless + always on top ----------------------------
         self.setWindowFlags(
             Qt.Window |
             Qt.FramelessWindowHint |
@@ -937,7 +1077,7 @@ class KioskWindow(QMainWindow):
         self.showFullScreen()
         QApplication.setOverrideCursor(Qt.BlankCursor)
 
-        # ── Central widget + layout ──────────────────────────────────────────
+        # -- Central widget + layout --------------------------------------------
         root = QWidget(); self.setCentralWidget(root)
         root.setStyleSheet(f"background:{_BG};")
         vlay = QVBoxLayout(root); vlay.setSpacing(0); vlay.setContentsMargins(0,0,0,0)
@@ -955,9 +1095,11 @@ class KioskWindow(QMainWindow):
             "SCANNING": ScanningPanel(self._cam_view),
             "WELCOME":  WelcomePanel(),
             "DENIED":   DeniedPanel(),
+            "ALIGN":    AlignPanel(self._cam_view),  # 5th state: guided alignment
         }
         for key, panel in self._panels.items():
             self._stack.addWidget(panel)
+
             
         vlay.addWidget(self._stack, 1)
 
@@ -1015,24 +1157,83 @@ class KioskWindow(QMainWindow):
 
         now = time.time()
 
+        # ── STANDBY ────────────────────────────────────────────────────────────
         if self._state == "STANDBY":
             if now - self._last_scan >= SCAN_INTERVAL:
                 self._last_scan = now
-                faces = self._recognizer.detect_faces(frame)
-                if faces:
-                    self._last_faces = faces
-                    print("👥  Face detected — starting recognition…")
-                    self._enter("SCANNING")
-                    self._run_recognition(frame)
-            # Camera hidden in STANDBY — no frame rendering needed
+
+                # Layer 1 — cheap motion/presence anywhere in frame
+                if self._presence.detect(frame):
+                    self._last_presence = now
+                    H, W = frame.shape[:2]
+
+                    # Layer 2 — AOI gate: only face centres inside the zone
+                    faces = self._recognizer.detect_faces(frame)
+                    aoi_faces = [
+                        f for f in faces
+                        if is_face_in_aoi(f[0], f[1], f[2], f[3], W, H)
+                    ]
+
+                    if aoi_faces:
+                        # Layer 3 — ArcFace recognition
+                        self._last_faces = aoi_faces
+                        print(f"[AOI] {len(aoi_faces)} face(s) in zone — scanning…")
+                        self._enter("SCANNING")
+                        self._run_recognition(frame)
+                    else:
+                        # Person present but not in AOI — show guide
+                        if faces:
+                            print(f"[AOI] {len(faces)} face(s) detected outside AOI zone")
+                        self._show_guidance_overlay(frame, faces)
+
+                elif (now - self._last_presence) < PRESENCE_COOLDOWN:
+                    # Recent motion, MOG2 settled — keep guide briefly
+                    self._show_guidance_overlay(frame, [])
+
+                elif DEBUG_AOI:
+                    disp = frame.copy()
+                    draw_aoi_overlay(disp, state="debug")
+                    self._cam_view.set_frame(disp)
             return
 
+        # ── ALIGN ──────────────────────────────────────────────────────────────
+        elif self._state == "ALIGN":
+            if now - self._last_scan >= SCAN_INTERVAL:
+                self._last_scan = now
+                H, W = frame.shape[:2]
+
+                if self._presence.detect(frame):
+                    self._last_presence = now
+                    faces = self._recognizer.detect_faces(frame)
+                    aoi_faces = [
+                        f for f in faces
+                        if is_face_in_aoi(f[0], f[1], f[2], f[3], W, H)
+                    ]
+                    if aoi_faces:
+                        self._last_faces = aoi_faces
+                        print("[AOI] Face moved into zone — scanning…")
+                        self._enter("SCANNING")
+                        self._run_recognition(frame)
+                        return
+                    else:
+                        self._show_guidance_overlay(frame, faces)
+                else:
+                    if (now - self._last_presence) >= PRESENCE_COOLDOWN:
+                        print("[AOI] Presence gone — returning to STANDBY")
+                        self._enter("STANDBY")
+                    else:
+                        self._show_guidance_overlay(frame, [])
+            return
+
+        # ── SCANNING ───────────────────────────────────────────────────────────
         elif self._state == "SCANNING":
             display = frame.copy()
             for (fx, fy, fw, fh) in self._last_faces:
                 draw_corner_box(display, fx, fy, fx+fw, fy+fh, _CV_CYAN, t=3)
+            draw_aoi_overlay(display, state="ready")   # green "Hold still" overlay
             self._cam_view.set_frame(display)
 
+        # ── WELCOME ────────────────────────────────────────────────────────────
         elif self._state == "WELCOME":
             tl = self._state_end - now
             self._panels["WELCOME"].set_time_left(tl, DOOR_OPEN_SECS)
@@ -1041,12 +1242,27 @@ class KioskWindow(QMainWindow):
                 self._enter("STANDBY")
                 return
 
+        # ── DENIED ─────────────────────────────────────────────────────────────
         elif self._state == "DENIED":
             tl = self._state_end - now
             self._panels["DENIED"].set_time_left(tl, DENIED_HOLD_SECS)
             if tl <= 0:
                 self._enter("STANDBY")
                 return
+
+    # ── Guidance overlay ───────────────────────────────────────────────────────
+    def _show_guidance_overlay(self, frame: np.ndarray, all_faces: list):
+        """Render live camera + amber AOI box; transition STANDBY -> ALIGN."""
+        display = frame.copy()
+        # Draw off-centre faces in dim red so user sees they are out of zone
+        for (fx, fy, fw, fh) in all_faces:
+            draw_corner_box(display, fx, fy, fx+fw, fy+fh, _CV_RED, t=2, L=20)
+        draw_aoi_overlay(display, state="wait")    # amber box + "Step into the frame"
+        self._cam_view.set_frame(display)
+        if self._state == "STANDBY":
+            self._enter("ALIGN")
+
+
 
     # ── Recognition in background thread ─────────────────────────────────────
     def _run_recognition(self, frame: np.ndarray):
@@ -1093,7 +1309,11 @@ class KioskWindow(QMainWindow):
         self._stack.setCurrentIndex(PANEL_IDX[state])
 
         if state == "STANDBY":
-            self._last_scan = 0.0
+            self._last_scan     = 0.0
+            self._last_presence = 0.0
+        elif state == "ALIGN":
+            self._last_scan = 0.0   # immediately re-check on next tick
+
 
     # ── Keyboard ──────────────────────────────────────────────────────────────
     def keyPressEvent(self, event):
