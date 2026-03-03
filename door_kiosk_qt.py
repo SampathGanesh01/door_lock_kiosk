@@ -47,7 +47,7 @@ LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asbl_logo.
 # ── Config ────────────────────────────────────────────────────────────────────
 FACES_DB          = "faces.json"
 RECOGNITION_MODEL = "ArcFace"
-COSINE_THRESHOLD  = 0.40
+COSINE_THRESHOLD  = 0.45   # unified with server; 0.40 was too strict for real-world mobile photos
 MIN_FACE_PIXELS   = 70
 SCAN_INTERVAL     = 1.5
 DOOR_OPEN_SECS    = 5
@@ -187,13 +187,21 @@ class FaceRecognizer:
         return list(rects) if len(rects) else []
 
     def embed(self, bgr_crop):
+        """Generate a 512-D ArcFace embedding from a BGR face crop.
+
+        align=True is CRITICAL and must match the server-side setting.
+        A mismatch between aligned and non-aligned embeddings produces high
+        cosine distances even for the same person, causing everyone to be denied.
+        """
         if not self._ready:
             return None
         try:
             res = self._DeepFace.represent(
                 img_path=cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB),
                 model_name=RECOGNITION_MODEL,
-                enforce_detection=False, detector_backend="skip", align=True,
+                enforce_detection=False,
+                detector_backend="skip",
+                align=True,   # MUST match server: both use align=True
             )
             if res and "embedding" in res[0]:
                 return np.array(res[0]["embedding"], dtype=np.float32)
@@ -669,105 +677,136 @@ class CameraView(QLabel):
 #  Background API Sync
 # ═══════════════════════════════════════════════════════════════════════════════
 class ApiSyncWorker(QThread):
+    """Background thread that syncs face data from the cloud server.
+
+    Key fix (v2): This worker now hits /api/faces.json which returns the FULL
+    512-D ArcFace embeddings generated on the server (with align=True).
+    Previously it hit /api/faces (summary only) and re-computed embeddings
+    from the 80×80 thumbnail using align=False — causing two problems:
+      1. Low-quality embeddings from a tiny blurry thumbnail
+      2. Alignment mismatch → high cosine distance → everyone denied
+
+    Now: server embeddings are copied directly to local faces.json with no
+    re-computation needed. Multiple embeddings per person are preserved.
+    """
     sync_completed = Signal(str)
+
+    # /api/faces.json returns full embeddings; /api/faces is summary-only
+    FACES_JSON_URL = "https://testasbl.sarvamsync.com/api/faces.json"
 
     def __init__(self):
         super().__init__()
         self._running = True
 
     def run(self):
-        url = "https://testasbl.sarvamsync.com/api/faces"
         while self._running:
             try:
-                print("🔄 Syncing from API...")
-                req = urllib.request.Request(url, headers={'accept': 'application/json'})
-                with urllib.request.urlopen(req, timeout=10) as response:
+                print("🔄 Syncing from API (full embeddings)…")
+                req = urllib.request.Request(
+                    self.FACES_JSON_URL,
+                    headers={'accept': 'application/json'}
+                )
+                with urllib.request.urlopen(req, timeout=15) as response:
                     raw = response.read()
-                    api_response = json.loads(raw)
 
-                # API returns: {"faces": [{name, user_id, samples, face_b64}, ...], "total": N}
-                api_faces_list = api_response.get("faces", [])
-
-                # Build a lookup dict keyed by user_id for stable comparison
-                # {user_id: {name, user_id, samples, face_b64}}
-                api_by_uid = {str(face["user_id"]): face for face in api_faces_list}
+                # /api/faces.json returns:
+                # { name: { user_id, embeddings: [[...512-D...], ...], face_b64, samples } }
+                server_db: dict = json.loads(raw)
 
                 # Load current local faces.json
-                # Format: {name: {embeddings: [...], user_id: ..., samples: ..., ...}}
-                local_data = {}
+                local_data: dict = {}
                 if os.path.exists(FACES_DB):
                     with open(FACES_DB, 'r') as f:
                         local_data = json.load(f)
 
-                # Build a lookup of local entries by user_id
-                local_by_uid = {}
-                for local_name, local_info in local_data.items():
-                    uid = str(local_info.get("user_id", ""))
-                    if uid:
-                        local_by_uid[uid] = local_name
-
                 # Load deleted faces archive
-                deleted_data = {}
+                deleted_data: dict = {}
                 if os.path.exists("deleted_faces.json"):
                     with open("deleted_faces.json", 'r') as f:
                         deleted_data = json.load(f)
 
                 changed = False
 
-                # ── Check for additions / updates ──────────────────────────
-                for uid, api_face in api_by_uid.items():
-                    api_name    = api_face["name"]
-                    api_samples = int(api_face.get("samples", 0))
+                # ── Build uid-keyed lookups for stable comparison ───────────
+                server_by_uid: dict = {
+                    str(data.get("user_id", "")): (name, data)
+                    for name, data in server_db.items()
+                    if data.get("user_id")
+                }
+                local_by_uid: dict = {
+                    str(info.get("user_id", "")): lname
+                    for lname, info in local_data.items()
+                    if info.get("user_id")
+                }
+
+                # ── Additions / updates ─────────────────────────────────────
+                for uid, (api_name, api_data) in server_by_uid.items():
+                    server_embs    = api_data.get("embeddings", [])
+                    server_samples = len(server_embs)
+                    face_b64       = api_data.get("face_b64", "")
 
                     if uid not in local_by_uid:
-                        # Brand-new person — add them (embeddings fetched separately or empty)
-                        print(f"➕ New person detected: {api_name} (uid={uid})")
+                        # Brand-new person — copy embeddings directly from server
+                        # (server already ran ArcFace with align=True, no re-compute needed)
+                        print(f"➕ New: {api_name} (uid={uid}) — {server_samples} embedding(s) from server")
                         local_data[api_name] = {
                             "user_id":    uid,
-                            "samples":    api_samples,
-                            "embeddings": [],   # embeddings are built locally by the kiosk
+                            "embeddings": server_embs,
+                            "face_b64":   face_b64,
+                            "samples":    server_samples,
                         }
                         local_by_uid[uid] = api_name
                         changed = True
+
                     else:
-                        # Person exists — check if sample count changed (means new embeddings added)
                         local_name = local_by_uid[uid]
                         local_info = local_data[local_name]
-                        local_samples = int(local_info.get("samples", 0))
+                        local_embs = local_info.get("embeddings", [])
 
-                        if api_samples != local_samples:
-                            print(f"🔄 Updated samples for {api_name}: {local_samples} → {api_samples}")
-                            local_data[local_name]["samples"] = api_samples
-                            # If name changed too, rename the entry
+                        # Sync when server has more embeddings or local has none
+                        need_sync = (server_samples > len(local_embs)) or (len(local_embs) == 0)
+
+                        if need_sync:
+                            # Rename if needed
                             if local_name != api_name:
                                 local_data[api_name] = local_data.pop(local_name)
                                 local_by_uid[uid] = api_name
+                                local_name = api_name
+                                print(f"✏️  Name: {local_name} → {api_name}")
+
+                            # Replace with full server embedding set directly
+                            local_data[local_name]["embeddings"] = server_embs
+                            local_data[local_name]["samples"]    = server_samples
+                            if face_b64:
+                                local_data[local_name]["face_b64"] = face_b64
+                            print(f"🔄 Updated {api_name}: {len(local_embs)} → {server_samples} embeddings")
                             changed = True
+
                         elif local_name != api_name:
-                            # Name changed but samples same — rename in place
-                            print(f"✏️ Name changed: {local_name} → {api_name}")
+                            # Name changed only
+                            print(f"✏️  Name: {local_name} → {api_name}")
                             local_data[api_name] = local_data.pop(local_name)
                             local_by_uid[uid] = api_name
                             changed = True
 
-                # ── Check for deletions ────────────────────────────────────
-                to_delete_uids = [uid for uid in local_by_uid if uid not in api_by_uid]
-                for uid in to_delete_uids:
-                    local_name = local_by_uid[uid]
-                    print(f"🗑️ Person removed from server: {local_name} (uid={uid}) → deleted_faces.json")
-                    deleted_data[local_name] = local_data.pop(local_name)
+                # ── Deletions ───────────────────────────────────────────────
+                for uid in [u for u in local_by_uid if u not in server_by_uid]:
+                    lname = local_by_uid[uid]
+                    print(f"🗑️  Removed: {lname} (uid={uid})")
+                    deleted_data[lname] = local_data.pop(lname)
                     changed = True
 
                 if changed:
-                    print(f"💾 Saving updated faces.json ({len(local_data)} persons)")
+                    total_embs = sum(len(v.get("embeddings", [])) for v in local_data.values())
+                    print(f"💾 Saved faces.json — {len(local_data)} persons, {total_embs} total embeddings")
                     with open(FACES_DB, 'w') as f:
                         json.dump(local_data, f, indent=2)
                     with open("deleted_faces.json", 'w') as f:
                         json.dump(deleted_data, f, indent=2)
                 else:
-                    print(f"✅ Faces up-to-date ({len(local_data)} persons, no changes)")
+                    total_embs = sum(len(v.get("embeddings", [])) for v in local_data.values())
+                    print(f"✅ Up-to-date: {len(local_data)} persons, {total_embs} total embeddings")
 
-                # Emit success with timestamp
                 now = datetime.now().strftime("%I:%M %p")
                 self.sync_completed.emit(f"Last Sync: {now}")
 
@@ -776,7 +815,6 @@ class ApiSyncWorker(QThread):
                 print(f"⚠️ Sync failed: {e}")
                 traceback.print_exc()
 
-            # Sleep 5 seconds, checking self._running every 0.5s for fast shutdown
             for _ in range(10):
                 if not self._running:
                     break
